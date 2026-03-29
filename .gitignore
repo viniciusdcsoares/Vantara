@@ -1,0 +1,22 @@
+# Ambientes Virtuais e cache do Python
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.py[cod]
+*$py.class
+
+# Chaves e credenciais
+.streamlit/secrets.toml
+.env
+
+# Outros
+.DS_Store
+
+# Arquivos de dados, logs e resultados gerados (Scraping e LLM)
+*.json
+*.csv
+outputs/
+data/
+logs/

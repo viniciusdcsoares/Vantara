@@ -1,0 +1,11 @@
+numpy==1.26.4
+google-api-python-client
+youtube-transcript-api
+langdetect
+lingua-language-detector
+fasttext-wheel
+atproto
+requests
+streamlit
+google-genai
+pydantic
