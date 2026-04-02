@@ -10,6 +10,7 @@ __pycache__/
 # Chaves e credenciais
 .streamlit/secrets.toml
 .env
+youtube_cookies.txt
 
 # Outros
 .DS_Store
@@ -17,6 +18,7 @@ __pycache__/
 # Arquivos de dados, logs e resultados gerados (Scraping e LLM)
 *.json
 *.csv
+*.parquet
 outputs/
 data/
 logs/
