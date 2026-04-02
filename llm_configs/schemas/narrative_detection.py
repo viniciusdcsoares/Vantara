@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List, Optional
 from enum import Enum
 
 # ==========================================
@@ -11,6 +11,11 @@ class GrowthStatus(str, Enum):
     STABLE = "stable"
     DECLINING = "declining"
     UNCLEAR = "unclear"
+
+class ClaimType(str, Enum):
+    FACTUAL = "factual"
+    ARGUMENTATIVE = "argumentative"
+    MIXED = "mixed"
 
 class KeyActor(BaseModel):
     handle: str = Field(description="The Bluesky handle of the actor (e.g., nucleo.jor.br)")
@@ -24,6 +29,25 @@ class KeyActor(BaseModel):
 class YoutubeAnalysis(BaseModel):
     core_narrative: str = Field(
         description="A concise summary of the primary narrative found in the video transcripts and descriptions."
+    )
+    canonical_claim: Optional[str] = Field(
+        default=None,
+        description="If possible, express the main claim defended or implied in this item as a short canonical sentence."
+    )
+    claim_type: ClaimType = Field(
+        description="Whether the main claim in this item is primarily factual, argumentative, or mixed."
+    )
+    factual_claim: Optional[str] = Field(
+        default=None,
+        description="If present, a short factual claim summarizing the key factual assertion in this item."
+    )
+    argument_claim_canonical: Optional[str] = Field(
+        default=None,
+        description="If present, a short argumentative claim that preserves the position but reduces slogans, insults, and excessive rhetoric."
+    )
+    argument_claim_raw: Optional[str] = Field(
+        default=None,
+        description="If present, a short argumentative claim that preserves the original argumentative formulation with minimal intervention."
     )
     dominant_framing: str = Field(
         description="How the issue is framed by the creators (e.g., educational, alarmist, economic analysis)."
@@ -51,6 +75,25 @@ class YoutubeAnalysis(BaseModel):
 class BlueskyAnalysis(BaseModel):
     core_narrative: str = Field(
         description="A concise summary of the primary narrative or discussion point found in the content cluster."
+    )
+    canonical_claim: Optional[str] = Field(
+        default=None,
+        description="If possible, express the main claim defended or implied in this item as a short canonical sentence."
+    )
+    claim_type: ClaimType = Field(
+        description="Whether the main claim in this item is primarily factual, argumentative, or mixed."
+    )
+    factual_claim: Optional[str] = Field(
+        default=None,
+        description="If present, a short factual claim summarizing the key factual assertion in this item."
+    )
+    argument_claim_canonical: Optional[str] = Field(
+        default=None,
+        description="If present, a short argumentative claim that preserves the position but reduces slogans, insults, and excessive rhetoric."
+    )
+    argument_claim_raw: Optional[str] = Field(
+        default=None,
+        description="If present, a short argumentative claim that preserves the original argumentative formulation with minimal intervention."
     )
     dominant_framing: str = Field(
         description="How the issue is being framed (e.g., as a regulatory issue, a moral panic, a technological advancement)."
@@ -93,6 +136,25 @@ class NewsEntity(BaseModel):
 class NewsAnalysis(BaseModel):
     core_narrative: str = Field(
         description="A concise summary of the primary journalistic narrative across the articles."
+    )
+    canonical_claim: Optional[str] = Field(
+        default=None,
+        description="If possible, express the main claim advanced or implied by the article as a short canonical sentence."
+    )
+    claim_type: ClaimType = Field(
+        description="Whether the main claim in this item is primarily factual, argumentative, or mixed."
+    )
+    factual_claim: Optional[str] = Field(
+        default=None,
+        description="If present, a short factual claim summarizing the key factual assertion in this item."
+    )
+    argument_claim_canonical: Optional[str] = Field(
+        default=None,
+        description="If present, a short argumentative claim that preserves the position but reduces slogans, insults, and excessive rhetoric."
+    )
+    argument_claim_raw: Optional[str] = Field(
+        default=None,
+        description="If present, a short argumentative claim that preserves the original argumentative formulation with minimal intervention."
     )
     journalistic_framing: str = Field(
         description="The angle the media is taking (e.g., economic opportunity, regulatory warning, technological breakthrough)."
