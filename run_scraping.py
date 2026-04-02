@@ -1,6 +1,8 @@
 import logging
 import os
 import json
+import time
+import random
 from datetime import datetime
 from typing import List, Dict, Optional
 
@@ -90,19 +92,52 @@ def run_all_scrapers(
     logging.info(f"Orchestration complete! File saved at: {final_path}")
     return consolidated_data
 
+# ==========================================
+# ORCHESTRATOR CONFIGURATION
+# ==========================================
+TOPICS_TO_SCRAPE = [
+    "Fundo Eleitoral",
+    "Reforma Tributária",
+    "Reforma da Previdência",
+    "Transição Energética",
+    "Atuação do STF",
+    "Guerra no Irã",
+    "Segurança Pública",
+    "Privatizações de Serviços",
+    "IA nas Eleições",
+    "Regulação das Redes Sociais"
+]
+
+TOPICS_TO_SCRAPE = ["Guerra no Irã", "Fundo Eleitoral"]
+
+
 if __name__ == "__main__":
-    test_topic = "Uso de Inteligencia Artificial"
-
-    youtube_config = {"max_videos": 3, "max_comments": 3, "min_views": 1000, "days": 5}
-    bluesky_config = {"max_posts": 3, "max_comments": 3, "days": 7}
-    news_config = {"max_articles": 3}
-
-    run_all_scrapers(
-        topic=test_topic,
-        scrapers_to_run=['youtube', 'bluesky', 'news'],
-        youtube_config=youtube_config,
-        bluesky_config=bluesky_config,
-        news_config=news_config
-    )
+    # Configuration parameters for depth of scraping
+    max_results = 10
+    max_comments = 5
+    days = 30
     
-    print(f"\n✅ Done! Check the outputs/scraping/ folder.")
+    youtube_cfg = {"max_videos": max_results, "max_comments": max_comments, "days": days, "min_views": 1000}
+    bluesky_cfg = {"max_posts": max_results, "max_comments": max_comments, "days": days}
+    news_cfg = {"max_articles": max_results}
+
+    print(f"📡 [Orquestrador] Iniciando pipeline para {len(TOPICS_TO_SCRAPE)} temas...\n")
+
+    for idx, topic in enumerate(TOPICS_TO_SCRAPE):
+        print(f"▶️ Executando tema {idx+1}/{len(TOPICS_TO_SCRAPE)}: '{topic}'")
+        
+        run_all_scrapers(
+            topic=topic,
+            scrapers_to_run=['youtube', 'bluesky', 'news'],
+            youtube_config=youtube_cfg,
+            bluesky_config=bluesky_cfg,
+            news_config=news_cfg
+        )
+        
+        # Anti-bot cooldown between complete themes
+        if idx < len(TOPICS_TO_SCRAPE) - 1:
+            cooldown = random.uniform(120, 240)
+            print(f"\n[Orquestrador] Tema '{topic}' finalizado. Pausando por {cooldown:.1f}s para evitar rate-limit...")
+            time.sleep(cooldown)
+
+    print(f"\n✅ Pipeline completo! Verifique a pasta outputs/scraping/.")
