@@ -1,17 +1,23 @@
 import os
 import json
 from pathlib import Path
+from typing import Optional
 
+import numpy as np
+import pandas as pd
 import streamlit as st
 from google import genai
 
+from sklearn.cluster import KMeans
+from sklearn.manifold import TSNE
+
 from llm_configs.functions import generate_gemini_json
 from llm_configs.prompts.narrative_detection import (
-    create_bluesky_prompt,
-    create_youtube_prompt,
-    create_news_prompt,
-    system_instruction_bluesky,
+    create_youtube_single_prompt,
+    create_bluesky_single_prompt,
+    create_news_single_prompt,
     system_instruction_youtube,
+    system_instruction_bluesky,
     system_instruction_news,
 )
 from llm_configs.schemas.narrative_detection import (
@@ -19,6 +25,34 @@ from llm_configs.schemas.narrative_detection import (
     YoutubeAnalysis,
     NewsAnalysis,
 )
+
+VALID_EMBEDDING_VARIANTS = {
+    "framing",
+    "core_narrative",
+    "canonical_claim",
+    "argument_claim_canonical",
+    "argument_claim_raw",
+}
+PRIMARY_ARGUMENT_EMBEDDING_VARIANT = "argument_claim_canonical"
+AUXILIARY_ARGUMENT_AUDIT_VARIANT = "argument_claim_raw"
+ARGUMENT_EMBEDDING_VARIANTS = {
+    "canonical_claim",  # legacy compatibility path
+    PRIMARY_ARGUMENT_EMBEDDING_VARIANT,
+    AUXILIARY_ARGUMENT_AUDIT_VARIANT,
+}
+EMBEDDING_MODEL = "gemini-embedding-001"
+DEFAULT_TEXT_FALLBACKS = {
+    "framing": "Sem enquadramento identificado",
+    "core_narrative": "Sem narrativa principal identificada",
+    "canonical_claim": "Sem claim canonica identificada",
+    "argument_claim_canonical": "Sem argument claim canonical identificada",
+    "argument_claim_raw": "Sem argument claim raw identificada",
+}
+
+
+# ==========================================
+# HELPERS
+# ==========================================
 
 def get_latest_scraping_file(scraping_dir: str) -> str:
     path = Path(scraping_dir)
@@ -30,6 +64,7 @@ def get_latest_scraping_file(scraping_dir: str) -> str:
     latest_file = max(files, key=os.path.getmtime)
     return str(latest_file)
 
+
 def clean_pydantic_output(response_dict: dict) -> dict:
     """Extrai os dados da classe Pydantic para dicionário, útil antes de salvar com json.dump."""
     if isinstance(response_dict, dict) and "result" in response_dict:
@@ -40,35 +75,231 @@ def clean_pydantic_output(response_dict: dict) -> dict:
                 result_content["output"] = output_obj.model_dump()
     return response_dict
 
-def run_analysis(data=None, topic=None):
+
+def _get_dominant_framing(clean_result: dict) -> str:
+    """Extrai o dominant_framing (ou journalistic_framing para News) de um resultado limpo."""
+    try:
+        output = clean_result.get("result", {}).get("output", {})
+        # YoutubeAnalysis e BlueskyAnalysis usam 'dominant_framing'
+        framing = output.get("dominant_framing")
+        # NewsAnalysis usa 'journalistic_framing'
+        if not framing:
+            framing = output.get("journalistic_framing", "")
+        return framing or ""
+    except Exception:
+        return ""
+
+
+def _get_output(clean_result: dict) -> dict:
+    try:
+        return clean_result.get("result", {}).get("output", {})
+    except Exception:
+        return {}
+
+
+def _get_core_narrative(clean_result: dict) -> str:
+    try:
+        return _get_output(clean_result).get("core_narrative", "") or ""
+    except Exception:
+        return ""
+
+
+def _get_canonical_claim(clean_result: dict) -> str:
+    try:
+        return _get_output(clean_result).get("canonical_claim", "") or ""
+    except Exception:
+        return ""
+
+
+def _get_claim_type(clean_result: dict) -> str:
+    try:
+        return _get_output(clean_result).get("claim_type", "") or ""
+    except Exception:
+        return ""
+
+
+def _get_factual_claim(clean_result: dict) -> str:
+    try:
+        return _get_output(clean_result).get("factual_claim", "") or ""
+    except Exception:
+        return ""
+
+
+def _get_argument_claim_canonical(clean_result: dict) -> str:
+    try:
+        output = _get_output(clean_result)
+        return (
+            output.get("argument_claim_canonical")
+            or output.get("argument_claim")
+            or ""
+        )
+    except Exception:
+        return ""
+
+
+def _get_argument_claim_raw(clean_result: dict) -> str:
+    try:
+        return _get_output(clean_result).get("argument_claim_raw", "") or ""
+    except Exception:
+        return ""
+
+
+def _build_item_id(source: str, index: int) -> str:
+    return f"{source.lower()}_{index + 1:04d}"
+
+
+def _select_embedding_text(
+    embedding_variant: str,
+    core_narrative: str,
+    framing_text: str,
+    canonical_claim: str,
+    argument_claim_canonical: str,
+    argument_claim_raw: str,
+) -> tuple[str, bool, str]:
+    # `canonical_claim` remains as a compatibility alias, but the preferred
+    # argument embedding path is `argument_claim_canonical`.
+    variant_map = {
+        "framing": framing_text,
+        "core_narrative": core_narrative,
+        "canonical_claim": argument_claim_canonical or canonical_claim,
+        "argument_claim_canonical": argument_claim_canonical,
+        "argument_claim_raw": argument_claim_raw,
+    }
+    selected_text = (variant_map.get(embedding_variant) or "").strip()
+    if embedding_variant == "canonical_claim" and argument_claim_canonical.strip():
+        selected_field = "argument_claim_canonical"
+    else:
+        selected_field = embedding_variant
+    missing_selected_text = not bool(selected_text)
+    if missing_selected_text:
+        selected_text = DEFAULT_TEXT_FALLBACKS[embedding_variant]
+        selected_field = f"{embedding_variant}_fallback"
+    return selected_text, missing_selected_text, selected_field
+
+
+def _should_include_in_argument_embedding(embedding_variant: str, claim_type: str) -> tuple[bool, Optional[str]]:
+    # Purely factual items remain persisted for audit, but they stay out of the
+    # main argument embedding/clustering path.
+    if embedding_variant in ARGUMENT_EMBEDDING_VARIANTS and claim_type == "factual":
+        return False, "claim_type_factual"
+    return True, None
+
+
+def _get_original_content(item: dict, source: str) -> str:
+    """Retorna um resumo legível do conteúdo original do item conforme a fonte."""
+    if source == "YouTube":
+        title = item.get("title", "")
+        channel = item.get("channel", "")
+        desc = (item.get("description") or "")[:300]
+        return f"[{channel}] {title} — {desc}"
+    elif source == "Bluesky":
+        author = item.get("author", "")
+        text = (item.get("text") or "")[:400]
+        return f"@{author}: {text}"
+    elif source == "News":
+        title = item.get("title", "")
+        src = item.get("source", "")
+        desc = (item.get("description") or "")[:300]
+        return f"[{src}] {title} — {desc}"
+    return str(item)[:400]
+
+
+def _build_embedding_item(
+    *,
+    item_id: str,
+    source: str,
+    topic: str,
+    original: str,
+    output: dict,
+    core_narrative: str,
+    framing: str,
+    canonical_claim: str,
+    claim_type: str,
+    factual_claim: str,
+    argument_claim_canonical: str,
+    argument_claim_raw: str,
+    embedding_variant: str,
+) -> dict:
+    # Preferred operational rule:
+    # - main embedding unit: argument_claim_canonical
+    # - auxiliary audit trail: argument_claim_raw
+    # - factual items: stored, but excluded from the main argument vector space
+    text_used_for_embedding, missing_selected_text, embedding_text_source = _select_embedding_text(
+        embedding_variant=embedding_variant,
+        core_narrative=core_narrative,
+        framing_text=framing,
+        canonical_claim=canonical_claim,
+        argument_claim_canonical=argument_claim_canonical,
+        argument_claim_raw=argument_claim_raw,
+    )
+    included_in_argument_embedding, exclusion_reason = _should_include_in_argument_embedding(
+        embedding_variant=embedding_variant,
+        claim_type=claim_type,
+    )
+    claim_missing = not bool((canonical_claim or "").strip())
+    claim_fallback_used = embedding_text_source.endswith("_fallback")
+
+    return {
+        "item_id": item_id,
+        "source": source,
+        "topic": topic,
+        "conteudo_original": original,
+        "core_narrative": core_narrative,
+        "dominant_framing": output.get("dominant_framing"),
+        "journalistic_framing": output.get("journalistic_framing"),
+        "claim_type": claim_type,
+        "factual_claim": factual_claim or None,
+        "argument_claim_canonical": argument_claim_canonical or None,
+        "argument_claim_raw": argument_claim_raw or None,
+        "canonical_claim": canonical_claim or None,
+        "text_used_for_embedding": text_used_for_embedding,
+        "embedding_text_source": embedding_text_source,
+        "embedding_variant": embedding_variant,
+        "claim_missing": claim_missing,
+        "claim_fallback_used": claim_fallback_used,
+        "missing_selected_text": missing_selected_text,
+        "included_in_argument_embedding": included_in_argument_embedding,
+        "argument_embedding_exclusion_reason": exclusion_reason,
+    }
+
+
+# ==========================================
+# CORE: ANÁLISE INDIVIDUAL POR ITEM/FONTE
+# ==========================================
+
+def run_analysis(data=None, topic=None, embedding_variant="framing"):
+    if embedding_variant not in VALID_EMBEDDING_VARIANTS:
+        raise ValueError(
+            f"embedding_variant invalido: {embedding_variant}. "
+            f"Use um de {sorted(VALID_EMBEDDING_VARIANTS)}."
+        )
+
     # 1. Carrega a chave de API
     api_key = st.secrets.get("GEMINI_API_KEY")
     if not api_key:
-        print("Aviso: GEMINI_API_KEY não foi encontrada. Pode dar erro na inicialização caso GOOGLE_API_KEY falte.")
+        print("Aviso: GEMINI_API_KEY não foi encontrada.")
 
     # 2. Inicializa o client do Google GenAI
     try:
         client = genai.Client(api_key=api_key)
     except Exception as e:
         print(f"Erro ao inicializar o client do Google GenAI: {e}")
-        return None, None
+        return None, None, None
 
     base_dir = Path(__file__).parent
-    
+
     # 3. Lê arquivo JSON da pasta outputs/scraping/ (caso data não venha do Streamlit)
     if data is None:
         scraping_dir = base_dir / "outputs" / "scraping"
-        
-        # Pegamos o arquivo mais recente:
         latest_file = get_latest_scraping_file(scraping_dir)
         if not latest_file:
             print(f"Nenhum arquivo JSON encontrado em {scraping_dir}")
-            return None, None
+            return None, None, None
 
         print(f"Lendo dados raspados do arquivo: {latest_file}")
         with open(latest_file, "r", encoding="utf-8") as f:
             data = json.load(f)
-        
+
         filename_stem = Path(latest_file).stem
     else:
         if topic:
@@ -79,79 +310,415 @@ def run_analysis(data=None, topic=None):
         else:
             filename_stem = "from_streamlit"
 
-    # 4. Garante que a pasta outputs/analysis exista
+    # Extrair tópico dos metadados para os prompts individuais
+    searched_topic = topic or "Unknown"
+    if not topic:
+        for meta_key in ["youtube_clipping_metadata", "bluesky_clipping_metadata", "newsapi_clipping_metadata"]:
+            for src_key in ["youtube_data", "bluesky_data", "news_data"]:
+                if data and src_key in data and data[src_key]:
+                    t = data[src_key].get(meta_key, {}).get("searched_topic")
+                    if t:
+                        searched_topic = t
+                        break
+
+    # 4. Garante que as pastas de output existam
     analysis_dir = base_dir / "outputs" / "analysis"
     analysis_dir.mkdir(parents=True, exist_ok=True)
+    embeddings_dir = base_dir / "outputs" / "embeddings"
+    embeddings_dir.mkdir(parents=True, exist_ok=True)
 
-    output_filename = f"narrative_detection_{filename_stem}.json"
+    run_id = f"{filename_stem}_{embedding_variant}"
+    output_filename = f"narrative_detection_{run_id}.json"
     output_filepath = analysis_dir / output_filename
+    items_output_filepath = analysis_dir / f"items_for_embedding_{run_id}.json"
 
     consolidated_results = {}
     prompts_enviados = {}
 
-    # 5. Verifica as chaves e executa a análise
-    
-    # 5.1. Youtube
+    # Lista para coletar dados para embeddings
+    items_for_embedding = []  # cada entrada: {fonte, conteudo_original, dominant_framing}
+
+    # ==========================================
+    # 5. ANÁLISE INDIVIDUAL POR ITEM
+    # ==========================================
+
+    # 5.1. YouTube – cada vídeo individualmente
     if data and "youtube_data" in data and data["youtube_data"] and data["youtube_data"].get("videos"):
-        print(">> Analisando YouTube...")
-        try:
-            prompt = create_youtube_prompt(data["youtube_data"])
-            prompts_enviados["youtube"] = {"system_instruction": system_instruction_youtube, "user_prompt": prompt}
-            result = generate_gemini_json(
-                client=client,
-                user_prompt=prompt,
-                system_instruction=system_instruction_youtube,
-                pydantic_schema=YoutubeAnalysis
-            )
-            consolidated_results["youtube_analysis"] = clean_pydantic_output(result)
-            print("✓ Análise do YouTube finalizada com sucesso.")
-        except Exception as e:
-            print(f"Erro na análise de YouTube: {e}")
-            consolidated_results["youtube_analysis"] = {"error": str(e)}
+        youtube_results = []
+        for i, video in enumerate(data["youtube_data"]["videos"]):
+            print(f">> Analisando YouTube vídeo {i+1}/{len(data['youtube_data']['videos'])}: {video.get('title', 'N/A')}")
+            try:
+                prompt = create_youtube_single_prompt(video, searched_topic)
+                if i == 0:
+                    prompts_enviados["youtube"] = {"system_instruction": system_instruction_youtube, "user_prompt": prompt}
 
-    # 5.2. Bluesky
+                result = generate_gemini_json(
+                    client=client,
+                    user_prompt=prompt,
+                    system_instruction=system_instruction_youtube,
+                    pydantic_schema=YoutubeAnalysis
+                )
+                clean = clean_pydantic_output(result)
+                youtube_results.append(clean)
+
+                item_id = _build_item_id("youtube", i)
+                output = _get_output(clean)
+                framing = _get_dominant_framing(clean)
+                core_narrative = _get_core_narrative(clean)
+                canonical_claim = _get_canonical_claim(clean)
+                claim_type = _get_claim_type(clean)
+                factual_claim = _get_factual_claim(clean)
+                argument_claim_canonical = _get_argument_claim_canonical(clean)
+                argument_claim_raw = _get_argument_claim_raw(clean)
+                original = _get_original_content(video, "YouTube")
+                items_for_embedding.append(_build_embedding_item(
+                    item_id=item_id,
+                    source="youtube",
+                    topic=searched_topic,
+                    original=original,
+                    output=output,
+                    core_narrative=core_narrative,
+                    framing=framing,
+                    canonical_claim=canonical_claim,
+                    claim_type=claim_type,
+                    factual_claim=factual_claim,
+                    argument_claim_canonical=argument_claim_canonical,
+                    argument_claim_raw=argument_claim_raw,
+                    embedding_variant=embedding_variant,
+                ))
+                print(f"  ✓ Vídeo {i+1} analisado com sucesso.")
+            except Exception as e:
+                print(f"  ✗ Erro no vídeo {i+1}: {e}")
+                youtube_results.append({"error": str(e)})
+
+        consolidated_results["youtube_analysis"] = youtube_results
+
+    # 5.2. Bluesky – cada post individualmente
     if data and "bluesky_data" in data and data["bluesky_data"] and data["bluesky_data"].get("posts"):
-        print(">> Analisando Bluesky...")
-        try:
-            prompt = create_bluesky_prompt(data["bluesky_data"])
-            prompts_enviados["bluesky"] = {"system_instruction": system_instruction_bluesky, "user_prompt": prompt}
-            result = generate_gemini_json(
-                client=client,
-                user_prompt=prompt,
-                system_instruction=system_instruction_bluesky,
-                pydantic_schema=BlueskyAnalysis
-            )
-            consolidated_results["bluesky_analysis"] = clean_pydantic_output(result)
-            print("✓ Análise do Bluesky finalizada com sucesso.")
-        except Exception as e:
-            print(f"Erro na análise do Bluesky: {e}")
-            consolidated_results["bluesky_analysis"] = {"error": str(e)}
+        bluesky_results = []
+        for i, post in enumerate(data["bluesky_data"]["posts"]):
+            print(f">> Analisando Bluesky post {i+1}/{len(data['bluesky_data']['posts'])}: @{post.get('author', 'N/A')}")
+            try:
+                prompt = create_bluesky_single_prompt(post, searched_topic)
+                if i == 0:
+                    prompts_enviados["bluesky"] = {"system_instruction": system_instruction_bluesky, "user_prompt": prompt}
 
-    # 5.3. News (Notícias)
+                result = generate_gemini_json(
+                    client=client,
+                    user_prompt=prompt,
+                    system_instruction=system_instruction_bluesky,
+                    pydantic_schema=BlueskyAnalysis
+                )
+                clean = clean_pydantic_output(result)
+                bluesky_results.append(clean)
+
+                item_id = _build_item_id("bluesky", i)
+                output = _get_output(clean)
+                framing = _get_dominant_framing(clean)
+                core_narrative = _get_core_narrative(clean)
+                canonical_claim = _get_canonical_claim(clean)
+                claim_type = _get_claim_type(clean)
+                factual_claim = _get_factual_claim(clean)
+                argument_claim_canonical = _get_argument_claim_canonical(clean)
+                argument_claim_raw = _get_argument_claim_raw(clean)
+                original = _get_original_content(post, "Bluesky")
+                items_for_embedding.append(_build_embedding_item(
+                    item_id=item_id,
+                    source="bluesky",
+                    topic=searched_topic,
+                    original=original,
+                    output=output,
+                    core_narrative=core_narrative,
+                    framing=framing,
+                    canonical_claim=canonical_claim,
+                    claim_type=claim_type,
+                    factual_claim=factual_claim,
+                    argument_claim_canonical=argument_claim_canonical,
+                    argument_claim_raw=argument_claim_raw,
+                    embedding_variant=embedding_variant,
+                ))
+                print(f"  ✓ Post {i+1} analisado com sucesso.")
+            except Exception as e:
+                print(f"  ✗ Erro no post {i+1}: {e}")
+                bluesky_results.append({"error": str(e)})
+
+        consolidated_results["bluesky_analysis"] = bluesky_results
+
+    # 5.3. News – cada artigo individualmente
     if data and "news_data" in data and data["news_data"] and data["news_data"].get("articles"):
-        print(">> Analisando News...")
-        try:
-            prompt = create_news_prompt(data["news_data"])
-            prompts_enviados["news"] = {"system_instruction": system_instruction_news, "user_prompt": prompt}
-            result = generate_gemini_json(
-                client=client,
-                user_prompt=prompt,
-                system_instruction=system_instruction_news,
-                pydantic_schema=NewsAnalysis
-            )
-            consolidated_results["news_analysis"] = clean_pydantic_output(result)
-            print("✓ Análise de News finalizada com sucesso.")
-        except Exception as e:
-            print(f"Erro na análise de News: {e}")
-            consolidated_results["news_analysis"] = {"error": str(e)}
+        news_results = []
+        for i, article in enumerate(data["news_data"]["articles"]):
+            print(f">> Analisando News artigo {i+1}/{len(data['news_data']['articles'])}: {article.get('title', 'N/A')}")
+            try:
+                prompt = create_news_single_prompt(article, searched_topic)
+                if i == 0:
+                    prompts_enviados["news"] = {"system_instruction": system_instruction_news, "user_prompt": prompt}
 
-    # 6. Salva resultado consolidado
+                result = generate_gemini_json(
+                    client=client,
+                    user_prompt=prompt,
+                    system_instruction=system_instruction_news,
+                    pydantic_schema=NewsAnalysis
+                )
+                clean = clean_pydantic_output(result)
+                news_results.append(clean)
+
+                item_id = _build_item_id("news", i)
+                output = _get_output(clean)
+                framing = _get_dominant_framing(clean)
+                core_narrative = _get_core_narrative(clean)
+                canonical_claim = _get_canonical_claim(clean)
+                claim_type = _get_claim_type(clean)
+                factual_claim = _get_factual_claim(clean)
+                argument_claim_canonical = _get_argument_claim_canonical(clean)
+                argument_claim_raw = _get_argument_claim_raw(clean)
+                original = _get_original_content(article, "News")
+                items_for_embedding.append(_build_embedding_item(
+                    item_id=item_id,
+                    source="news",
+                    topic=searched_topic,
+                    original=original,
+                    output=output,
+                    core_narrative=core_narrative,
+                    framing=framing,
+                    canonical_claim=canonical_claim,
+                    claim_type=claim_type,
+                    factual_claim=factual_claim,
+                    argument_claim_canonical=argument_claim_canonical,
+                    argument_claim_raw=argument_claim_raw,
+                    embedding_variant=embedding_variant,
+                ))
+                print(f"  ✓ Artigo {i+1} analisado com sucesso.")
+            except Exception as e:
+                print(f"  ✗ Erro no artigo {i+1}: {e}")
+                news_results.append({"error": str(e)})
+
+        consolidated_results["news_analysis"] = news_results
+
+    # 6. Salva análise consolidada (por item)
     print(f"Salvando resultados consolidados em: {output_filepath}")
     with open(output_filepath, "w", encoding="utf-8") as f:
         json.dump(consolidated_results, f, ensure_ascii=False, indent=4)
-        
+
+    with open(items_output_filepath, "w", encoding="utf-8") as f:
+        json.dump(items_for_embedding, f, ensure_ascii=False, indent=4)
+
+    # ==========================================
+    # 7. EMBEDDINGS, CLUSTERIZAÇÃO E t-SNE
+    # ==========================================
+
+    embeddings_dataset = None
+    fallback_zero_vector_count = 0
+    items_for_argument_embedding = [
+        item for item in items_for_embedding if item["included_in_argument_embedding"]
+    ]
+    clustering_metadata_path = embeddings_dir / f"clustering_metadata_{run_id}.json"
+    clustering_metadata = {
+        "run_id": run_id,
+        "topic": searched_topic,
+        "embedding_variant": embedding_variant,
+        "primary_argument_embedding_variant": PRIMARY_ARGUMENT_EMBEDDING_VARIANT,
+        "auxiliary_argument_audit_variant": AUXILIARY_ARGUMENT_AUDIT_VARIANT,
+        "factual_routing_rule": "exclude_from_argument_embedding_when_claim_type_is_factual",
+        "embedding_model": EMBEDDING_MODEL,
+        "clustering_algorithm": "kmeans",
+        "n_clusters": 3,
+        "item_count": len(items_for_embedding),
+        "included_in_argument_embedding_count": len(items_for_argument_embedding),
+        "excluded_from_argument_embedding_count": len(items_for_embedding) - len(items_for_argument_embedding),
+        "excluded_factual_count": sum(
+            1 for item in items_for_embedding if item["argument_embedding_exclusion_reason"] == "claim_type_factual"
+        ),
+        "fallback_zero_vector_count": 0,
+        "claim_missing_count": sum(1 for item in items_for_embedding if item["claim_missing"]),
+        "claim_fallback_used_count": sum(1 for item in items_for_embedding if item["claim_fallback_used"]),
+        "items_artifact_path": str(items_output_filepath),
+    }
+
+    if items_for_argument_embedding:
+        print(f"\n>> Gerando embeddings para {len(items_for_argument_embedding)} itens...")
+
+        # 7.1. Gerar embeddings do campo selecionado
+        texts_to_embed = [item["text_used_for_embedding"] for item in items_for_argument_embedding]
+        item_embeddings = []
+
+        for i, text_to_embed in enumerate(texts_to_embed):
+            try:
+                result = client.models.embed_content(
+                    model=EMBEDDING_MODEL,
+                    contents=text_to_embed
+                )
+                emb = np.array(result.embeddings[0].values)
+                item_embeddings.append(emb)
+            except Exception as e:
+                print(f"  ✗ Erro ao gerar embedding do item {i+1}: {e}")
+                # Fallback: vetor de zeros
+                item_embeddings.append(np.zeros(768))
+                fallback_zero_vector_count += 1
+
+        # 7.2. Gerar embeddings das 3 âncoras semânticas
+        anchors_text = [
+            "Favorável à legalização do aborto",
+            "Contrário a legalização do aborto",
+            "Neutro a legalização do aborto"
+        ]
+        anchor_embeddings = []
+        for anchor in anchors_text:
+            try:
+                result = client.models.embed_content(
+                    model=EMBEDDING_MODEL,
+                    contents=anchor
+                )
+                anchor_embeddings.append(np.array(result.embeddings[0].values))
+            except Exception as e:
+                print(f"  ✗ Erro ao gerar embedding da âncora '{anchor}': {e}")
+                anchor_embeddings.append(np.zeros(768))
+
+        # 7.3. K-Means nos embeddings dos itens (k=3)
+        print(">> Aplicando K-Means (k=3) nos embeddings dos itens...")
+        all_item_embs = np.array(item_embeddings)
+
+        if len(all_item_embs) >= 3:
+            kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
+            clusters = kmeans.fit_predict(all_item_embs)
+        else:
+            # Se menos de 3 itens, atribuí-los ao cluster 0
+            clusters = np.zeros(len(all_item_embs), dtype=int)
+
+        # 7.4. t-SNE — todos juntos (itens + âncoras)
+        print(">> Aplicando t-SNE (2D) para redução de dimensionalidade...")
+        all_embeddings = np.vstack([all_item_embs] + [e.reshape(1, -1) for e in anchor_embeddings])
+
+        # Ajustar perplexity se houver poucos pontos
+        n_samples = len(all_embeddings)
+        perplexity = min(15, max(2, n_samples - 1))
+
+        tsne = TSNE(n_components=2, perplexity=perplexity, random_state=42, init='pca')
+        reduced_tsne = tsne.fit_transform(all_embeddings)
+
+        # Separar coordenadas
+        item_tsne = reduced_tsne[:len(items_for_argument_embedding)]
+        anchor_tsne = reduced_tsne[len(items_for_argument_embedding):]
+
+        # 7.5. Montar dataset final
+        records = []
+        for i, item in enumerate(items_for_argument_embedding):
+            records.append({
+                "item_id": item["item_id"],
+                "source": item["source"],
+                "topic": item["topic"],
+                "conteudo_original": item["conteudo_original"],
+                "core_narrative": item["core_narrative"],
+                "dominant_framing": item["dominant_framing"],
+                "journalistic_framing": item["journalistic_framing"],
+                "claim_type": item["claim_type"],
+                "factual_claim": item["factual_claim"],
+                "argument_claim_canonical": item["argument_claim_canonical"],
+                "argument_claim_raw": item["argument_claim_raw"],
+                "canonical_claim": item["canonical_claim"],
+                "text_used_for_embedding": item["text_used_for_embedding"],
+                "embedding_text_source": item["embedding_text_source"],
+                "embedding_variant": item["embedding_variant"],
+                "claim_missing": item["claim_missing"],
+                "claim_fallback_used": item["claim_fallback_used"],
+                "missing_selected_text": item["missing_selected_text"],
+                "included_in_argument_embedding": item["included_in_argument_embedding"],
+                "argument_embedding_exclusion_reason": item["argument_embedding_exclusion_reason"],
+                "cluster": int(clusters[i]),
+                "tsne_x": float(item_tsne[i, 0]),
+                "tsne_y": float(item_tsne[i, 1]),
+                "is_anchor": False
+            })
+
+        for i, anchor in enumerate(anchors_text):
+            records.append({
+                "item_id": f"anchor_{i + 1}",
+                "source": "anchor",
+                "topic": searched_topic,
+                "conteudo_original": anchor,
+                "core_narrative": None,
+                "dominant_framing": anchor,
+                "journalistic_framing": None,
+                "claim_type": None,
+                "factual_claim": None,
+                "argument_claim_canonical": None,
+                "argument_claim_raw": None,
+                "canonical_claim": None,
+                "text_used_for_embedding": anchor,
+                "embedding_text_source": "anchor",
+                "embedding_variant": embedding_variant,
+                "claim_missing": False,
+                "claim_fallback_used": False,
+                "missing_selected_text": False,
+                "included_in_argument_embedding": False,
+                "argument_embedding_exclusion_reason": None,
+                "cluster": -1,
+                "tsne_x": float(anchor_tsne[i, 0]),
+                "tsne_y": float(anchor_tsne[i, 1]),
+                "is_anchor": True
+            })
+
+        embeddings_dataset = pd.DataFrame(records)
+
+        # 7.6. Salvar em parquet e JSON
+        parquet_path = embeddings_dir / f"embeddings_{run_id}.parquet"
+        json_emb_path = embeddings_dir / f"embeddings_{run_id}.json"
+
+        embeddings_dataset.to_parquet(parquet_path, index=False)
+        embeddings_dataset.to_json(json_emb_path, orient="records", force_ascii=False, indent=4)
+        clustering_metadata.update({
+            "fallback_zero_vector_count": fallback_zero_vector_count,
+            "embeddings_parquet_path": str(parquet_path),
+            "embeddings_json_path": str(json_emb_path),
+        })
+        with open(clustering_metadata_path, "w", encoding="utf-8") as f:
+            json.dump(clustering_metadata, f, ensure_ascii=False, indent=4)
+
+        print(f"✓ Dataset de embeddings salvo em: {parquet_path}")
+        print(f"✓ Dataset de embeddings salvo em: {json_emb_path}")
+        print(f"✓ Metadados de clustering salvos em: {clustering_metadata_path}")
+    else:
+        print("\n>> Nenhum item elegivel para embedding argumentativo nesta rodada.")
+        with open(clustering_metadata_path, "w", encoding="utf-8") as f:
+            json.dump(clustering_metadata, f, ensure_ascii=False, indent=4)
+
     print("Processo finalizado!")
-    return consolidated_results, prompts_enviados
+    return consolidated_results, prompts_enviados, clustering_metadata
+
+
+TOPICS_TO_ANALYZE = [
+    "Fundo Eleitoral",
+    "Reforma da Previdência",
+    "Transição Energética",
+    "Atuação do STF",
+    "Guerra no Irã",
+    "Segurança Pública",
+]
 
 if __name__ == "__main__":
-    run_analysis()
+    import time, random
+
+    scraping_dir = Path("outputs") / "scraping"
+    print(f"[LLM Analysis] Iniciando analise para {len(TOPICS_TO_ANALYZE)} temas...\n")
+
+    for idx, topic in enumerate(TOPICS_TO_ANALYZE):
+        slug = topic.replace(" ", "_").lower()
+        matching_files = sorted(
+            scraping_dir.glob(f"{slug}_*.json"),
+            key=lambda p: p.stat().st_mtime, reverse=True
+        )
+        if not matching_files:
+            print(f"[{idx+1}/{len(TOPICS_TO_ANALYZE)}] Nenhum arquivo para topic=\'{topic}\'. Pulando.")
+            continue
+        latest_file = matching_files[0]
+        print(f"[{idx+1}/{len(TOPICS_TO_ANALYZE)}] Analisando \'{topic}\' -> {latest_file.name}")
+        with open(latest_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        run_analysis(data=data, topic=topic, embedding_variant="argument_claim_canonical")
+        print(f"Tema \'{topic}\' concluido.\n")
+        if idx < len(TOPICS_TO_ANALYZE) - 1:
+            cooldown = random.uniform(10, 20)
+            print(f"[LLM] Pausando {cooldown:.1f}s...")
+            time.sleep(cooldown)
+
+    print("Pipeline de analise LLM completo!")
