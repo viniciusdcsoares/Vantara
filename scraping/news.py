@@ -5,10 +5,14 @@ import time
 import random
 from datetime import datetime, timedelta
 
+from logger_configs import setup_logger
+logger = setup_logger("scraping")
+
 # ==========================================
 # 1. CREDENTIALS AND SETUP
 # ==========================================
-API_KEY = st.secrets['NEWS_API_KEY'] # 
+API_KEY = st.secrets['NEWS_API_KEY']
+JINA_API_KEY = st.secrets['JINA_API_KEY'] # 
 
 # ==========================================
 # 2. HELPER FUNCTIONS
@@ -25,6 +29,28 @@ def format_br_date(iso_date):
     except Exception:
         return iso_date
 
+def ler_noticia_com_jina(link_da_noticia):
+    """
+    Extrai o texto completo da notícia em formato Markdown utilizando a Jina AI Reader API.
+    """
+    logger.debug(f"Jina fetching: {link_da_noticia[:70]}")
+
+    url_jina = f"https://r.jina.ai/{link_da_noticia}"
+
+    headers = {
+        "Authorization": f"Bearer {JINA_API_KEY}",
+        "X-Engine": "browser",          
+        "X-Return-Format": "markdown"   
+    }
+
+    try:
+        response = requests.get(url_jina, headers=headers, timeout=30)
+        response.raise_for_status() 
+        return response.text # Retorna diretamente o texto em Markdown
+    except Exception as e:
+        logger.error(f"Jina fetch failed for {link_da_noticia[:50]}: {e}")
+        return None
+
 def fetch_newsapi_articles(topic):
     """Hits the API and fetches raw articles"""
     #print(f"🔍 Searching for news about '{topic}'...")
@@ -40,9 +66,9 @@ def fetch_newsapi_articles(topic):
         return data.get("articles", [])
         
     except requests.exceptions.RequestException as e:
-        print(f"❌ Connection error with NewsAPI: {e}")
+        logger.error(f"NewsAPI connection error: {e}")
         try:
-            print(f"   Detail: {response.json().get('message')}")
+            logger.error(f"NewsAPI detail: {response.json().get('message')}")
         except:
             pass
         return []
@@ -52,14 +78,11 @@ def fetch_newsapi_articles(topic):
 # ==========================================
 def generate_newsapi_clipping_json(topic, max_articles=5):
     
-    print(f"🚀 Starting News scraping for the topic '{topic}'")
+    logger.info(f"Scraping started | topic='{topic}'")
 
     raw_articles = fetch_newsapi_articles(topic)
-    #print(f"✅ Search completed. Evaluating {len(raw_articles)} results...\n")
 
     complete_data = []
-    
-    # ### NEW: Stores the name of the portals that have already entered the list
     seen_sources = set() 
 
     for article in raw_articles:
@@ -72,34 +95,31 @@ def generate_newsapi_clipping_json(topic, max_articles=5):
 
         source_name = article.get("source", {}).get("name", "Unknown Source")
         
-        # ### NEW: Diversity Filter (Prevents monopoly from a single site)
         if source_name in seen_sources:
-            print(f"   ⏭️ Skipping article from '{source_name}' (we already have a source from this site).")
+            logger.warning(f"DISCARD | Source already captured: '{source_name}' | title='{title[:50]}'")
             continue
 
-        print(f"🔄 Processing article from 'new' channel ({source_name}): {title[:40]}...")
+        logger.debug(f"Processing article | source='{source_name}' | title='{title[:50]}'")
 
-        #delay = random.uniform(1.0, 2.0)
-        #time.sleep(delay)
+        url = article.get("url", "")
+        full_content = ler_noticia_com_jina(url) if url else None
 
-        # Builds the clean and safe dictionary using .get() with default values (or "...")
         complete_data.append({
             "title": title,
             "author": article.get("author") or "Unknown Author",
             "source": article.get("source", {}).get("name", "Unknown Source"), 
             "description": article.get("description") or "No description available.",
             "publication_date": format_br_date(article.get("publishedAt")),
-            "url": article.get("url", ""),
-            "content": article.get("content")
+            "url": url,
+            "content": full_content or ""
         })
         
         seen_sources.add(source_name)
 
     if not complete_data:
-        print("\n❌ No valid articles found.")
+        logger.warning(f"No valid articles found for topic='{topic}'.")
         return None
 
-    # Standardized JSON structure identical to YouTube and Bluesky
     final_output = {
         "newsapi_clipping_metadata": {
             "searched_topic": topic,
@@ -110,10 +130,8 @@ def generate_newsapi_clipping_json(topic, max_articles=5):
     }
 
     file_name = f"news_clipping_{topic.replace(' ', '_').lower()}.json"
-    #with open(file_name, "w", encoding="utf-8") as f:
-    #    json.dump(final_output, f, indent=4, ensure_ascii=False)
 
-    print(f"\n🎉 Success! {len(complete_data)} articles saved in: {file_name}")
+    logger.info(f"DONE | {len(complete_data)} articles saved | file='{file_name}'")
     return final_output
 
 # ==========================================
