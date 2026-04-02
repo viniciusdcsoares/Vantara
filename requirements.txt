@@ -1,4 +1,7 @@
 numpy==1.26.4
+pandas
+scikit-learn
+pyarrow
 google-api-python-client
 youtube-transcript-api
 langdetect
@@ -9,3 +12,4 @@ requests
 streamlit
 google-genai
 pydantic
+yt-dlp
