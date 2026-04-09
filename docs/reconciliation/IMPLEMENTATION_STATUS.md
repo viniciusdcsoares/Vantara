@@ -79,8 +79,8 @@ Phase 1: Collection (run_scraping.py)
 │       ├──→ Bluesky Connector ──→ search + thread replies                │
 │       │         uses: AT Protocol (atproto)                             │
 │       │                                                                 │
-│       └──→ NewsAPI Connector ──→ article search                         │
-│                 uses: NewsAPI.org (source diversity filter)             │
+│       ├──→ NewsAPI Connector ──→ article search + Full-text extraction  │
+│                 uses: NewsAPI.org, Jina AI Reader API (Markdown)        │
 │                                                                         │
 │  Output: outputs/scraping/{topic}_{timestamp}.json                      │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -153,6 +153,8 @@ Phase 3: Audit & Review (audit_nearest_neighbors.py, prepare_manual_review.py)
 - Extracts full Portuguese transcripts via `youtube-transcript-api`
 - **Hard Vote language filter**: 3 independent detectors (`langdetect`, `lingua`, `fasttext`)
 - **Anti-bot measures**: randomized jitter (3–7s) between processing steps
+- **Interleaved Batching**: Extractions are chunked and interrupted with Bluesky/News executions to grant natural cooldown protection to the active IP.
+- **Strict Quotas**: Adheres to a safe limit of ~70 requests per IP/day (ceiling 120) to block shadowbanning.
 - **Authentication**: supports local cookie auth via `youtube_cookies.txt` (to bypass transcript availability blocks)
 - Captures: title, channel, link, stats (views, likes, comments), duration, hidden tags, full description, transcript, and most-liked comments
 
@@ -165,9 +167,10 @@ Phase 3: Audit & Review (audit_nearest_neighbors.py, prepare_manual_review.py)
 
 **NewsAPI (`scraping/news.py`):**
 - REST client hitting `newsapi.org/v2/everything`
-- **Source diversity filter**: max 1 article per news outlet (prevents portal monopoly)
+- **Source diversity filter (Round-Robin)**: Aggregates initial articles by domain, then extracts them sequentially looping through each source to guarantee max diversity without artificial volume ceilings.
+- **Full-text extraction**: uses **Jina AI Reader API** (`r.jina.ai`) to convert article URLs into clean Markdown
 - Sorted by `publishedAt`, filtered by `language=pt`
-- Captures: title, author, source name, description, publication date, URL, content snippet
+- Captures: title, author, source name, description, publication date, URL, and **full Markdown content** (stored in the `content` field)
 
 ---
 
@@ -178,7 +181,10 @@ Phase 3: Audit & Review (audit_nearest_neighbors.py, prepare_manual_review.py)
 | [ADR-001](../adr/ADR-001-per-item-analysis-foundation.md) | Per-item granular analysis as pipeline foundation. Each content item analyzed individually producing `canonical_claim` + `claim_type`. | **Accepted** |
 | [ADR-002](../adr/ADR-002-canonical-claim-over-framing.md) | `canonical_claim` as the sole embedding input. Framing deprecated from the clustering dimension — used for display only. | **Accepted** |
 | [ADR-003](../adr/ADR-003-streamlit-mvp-runtime.md) | Streamlit + flat Python scripts as MVP runtime. No FastAPI/PostgreSQL/Redis until pipeline intelligence logic is validated with real data. | **Accepted** |
-| [ADR-004](../adr/ADR-004-youtube-anti-bot-measures.md) | YouTube anti-bot measures: randomized jitter (3-7s), batch processing, and local cookie authentication via `youtube_cookies.txt`. | **Accepted** |
+| [ADR-004](../adr/ADR-004-youtube-anti-bot-measures.md) | YouTube anti-bot measures: randomized jitter (3-7s), interleaved processing, local cookie authentication, and daily quotas (70-120 req/IP). | **Accepted** |
+| [ADR-005](../adr/ADR-005-hierarchical-clustering.md) | Two-layer Hierarchical Clustering (Macro/Micro) using mixed datasets via UMAP+HDBSCAN, with locked hyperparameters for semantic purity. | **Accepted** |
+| [ADR-006](../adr/ADR-006-news-round-robin.md) | Round-Robin distribution algorithm for News extraction to guarantee max source diversity without arbitrary volume constraints. | **Accepted** |
+| [ADR-007](../adr/ADR-007-dashboard-hierarchical-ui.md) | Streamlit UX Refactor: Auto-loading historical runs and Drill-down UI translating Macro bubble scatter maps into fragmented Micro clusters. | **Accepted** |
 
 ---
 
@@ -250,6 +256,7 @@ When given a task, implement **only** the specific feature or change requested. 
 The active tech stack is:
 - **Python 3.12** with `requirements.txt` dependency management
 - **Google Gemini** (`google-genai`) for LLM calls, not OpenAI
+- **Jina AI Reader API** for high-quality full-text news extraction in Markdown
 - **Streamlit** for UI interactions and secret management
 - **Pydantic** for structured output validation
 - **Flat JSON files** for data persistence

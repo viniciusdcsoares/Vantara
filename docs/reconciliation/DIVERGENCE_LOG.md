@@ -91,14 +91,14 @@ A divergence is classified as **critical** when it blocks the advancement of the
 
 | Dimension | Legacy Docs | Current Code |
 |---|---|---|
-| **Clustering algorithm** | K-Means or HDBSCAN over embedding vectors | K-Means (k=3) implemented in `run_llm_analysis.py`. |
-| **Narrative inference** | LLM call per cluster to infer the overarching narrative frame | Partially implemented: clustering exists; narrative inference per cluster is the next step for human-in-the-loop validation. |
-| **Narrative graph** | Full relational model with temporal tracking | Flat JSON/Parquet with `item_id` and `cluster` mapping. |
-| **Cross-source detection** | YouTube, Bluesky, and News items share the same embedding space. | **Converged**: Cross-source clustering is now functional. |
+| **Clustering algorithm** | K-Means or HDBSCAN over embedding vectors | **Converged**: Hierarchical Two-Layer HDBSCAN (Macro and Micro) over mixed topic UMAP variables via `run_clustering.py`. |
+| **Narrative inference** | LLM call per cluster to infer the overarching narrative frame | **Converged**: Deep inference applied—the LLM dynamically processes and names both overarching Macro themes and localized Micro biases. |
+| **Narrative graph** | Full relational model with temporal tracking | Flat JSON/Parquet with layered relationship mapping (`cluster` and `micro_cluster`). |
+| **Cross-source detection** | YouTube, Bluesky, and News items share the same embedding space. | **Converged**: Mixed architecture aggregates multiple historical topics into dense semantic maps simultaneously. |
 | **Source docs** | `07_narrative_graph_architecture.md`, `14_narrative_scoring_and_argument_model.md` |
-| **Status** | **Converged** |
+| **Status** | **Converged (Advanced)** |
 
-**Impact:** Blocking for MVP v1. Cross-source narrative clustering is the central differentiator of the Vantara platform. This is sequentially dependent on DIV-006 (embeddings).
+**Impact:** Resolved/Converged. The transition to a two-layer Macro/Micro hierarchical structure fulfills the target architecture's requirement for cross-source narrative detection, expanding on it to allow deep sub-bias exploration without losing the macro context.
 
 ---
 
@@ -188,6 +188,6 @@ These legacy documents have been explicitly superseded by active implementations
 | Priority | Divergences | What They Block | Action Required |
 |---|---|---|---|
 | ✅ **P0 — Blocking** | DIV-004, DIV-005 | — | **Converged** (Per-item analysis implemented) |
-| ✅ **P1 — Required for v1** | DIV-006, DIV-007 | — | **Converged** (Embeddings & Clustering implemented) |
+| ✅ **P1 — Required for v1** | DIV-006, DIV-007 | — | **Converged** (Embeddings & Hierarchical Clustering implemented) |
 | 🟡 **P2 — Deferred** | DIV-001, DIV-002, DIV-003, DIV-008, DIV-009 | Multi-tenant, numeric scoring | After intelligence pipeline stabilization |
 | ⚪ **P3 — Cosmetic** | DIV-010, DIV-011, DIV-012 | Nothing functional | Address during future major refactor |
