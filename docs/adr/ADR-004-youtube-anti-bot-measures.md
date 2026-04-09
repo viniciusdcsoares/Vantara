@@ -25,9 +25,10 @@ The goal is to make the YouTube connector (`scraping/youtube.py`) more robust, h
 Specific implementations include:
 
 1.  **Randomized Jitter/Delays**: Replace fixed pauses with random intervals (e.g., 3-7 seconds) between video metadata and transcript fetch attempts to mimic human browsing behavior.
-2.  **Batch Processing**: Structure the extraction loop to process videos in small, non-deterministic batches.
+2.  **Batch Processing & Interleaved Cooldowns**: Structure the extraction loop to process videos in small, non-deterministic batches. Critically, to protect IP reputation, extraction is interleaved with execution of Bluesky and NewsAPI requests, creating "natural cooldown periods" for the connection before hitting YouTube again.
 3.  **Local Cookie Integration**: Support reading from a `youtube_cookies.txt` file (Netscape format) to initialize the `YouTubeTranscriptApi`. This allows the script to leverage an authenticated session, significantly reducing "not available" or rate-limit errors.
 4.  **Circuit Breaker (429 Handling)**: Implement a mechanism to detect recurring IP blocks and gracefully halt execution rather than hammering the API, which could lead to permanent bans.
+5.  **Strict Operational Quotas**: Discovered and implemented a hard operational threshold: the pipeline limits YouTube extractions to roughly 70 requests per IP per day (bursting to an absolute maximum of 120) to prevent shadowbans and 429 locks.
 
 ### What This Changes
 
