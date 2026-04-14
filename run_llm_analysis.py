@@ -16,24 +16,29 @@ from llm_configs.prompts.narrative_detection import (
     create_youtube_single_prompt,
     create_bluesky_single_prompt,
     create_news_single_prompt,
+    create_comment_alignment_prompt,
     system_instruction_youtube,
     system_instruction_bluesky,
     system_instruction_news,
+    system_instruction_comment_alignment,
 )
 from llm_configs.schemas.narrative_detection import (
     BlueskyAnalysis,
     YoutubeAnalysis,
     NewsAnalysis,
+    CommentAnalysis,
+    EngagementMetrics,
 )
 
 VALID_EMBEDDING_VARIANTS = {
     "framing",
     "core_narrative",
     "canonical_claim",
+    "embedding_ready_text",
     "argument_claim_canonical",
     "argument_claim_raw",
 }
-PRIMARY_ARGUMENT_EMBEDDING_VARIANT = "argument_claim_canonical"
+PRIMARY_ARGUMENT_EMBEDDING_VARIANT = "embedding_ready_text"
 AUXILIARY_ARGUMENT_AUDIT_VARIANT = "argument_claim_raw"
 ARGUMENT_EMBEDDING_VARIANTS = {
     "canonical_claim",  # legacy compatibility path
@@ -45,6 +50,7 @@ DEFAULT_TEXT_FALLBACKS = {
     "framing": "Sem enquadramento identificado",
     "core_narrative": "Sem narrativa principal identificada",
     "canonical_claim": "Sem claim canonica identificada",
+    "embedding_ready_text": "Target: unknown. TargetType: other. Stance: neutral. Relation: describe. Claim: Sem claim canonica identificada. Rationale: insufficient argumentative detail.",
     "argument_claim_canonical": "Sem argument claim canonical identificada",
     "argument_claim_raw": "Sem argument claim raw identificada",
 }
@@ -148,40 +154,121 @@ def _build_item_id(source: str, index: int) -> str:
     return f"{source.lower()}_{index + 1:04d}"
 
 
+def _normalize_text(value: Optional[str], fallback: str = "") -> str:
+    normalized = (value or "").strip()
+    return normalized or fallback
+
+
+def _get_argument_target(clean_result: dict) -> str:
+    try:
+        return _get_output(clean_result).get("argument_target", "") or ""
+    except Exception:
+        return ""
+
+
+def _get_target_type(clean_result: dict) -> str:
+    try:
+        return _get_output(clean_result).get("target_type", "") or ""
+    except Exception:
+        return ""
+
+
+def _get_stance_polarity(clean_result: dict) -> str:
+    try:
+        return _get_output(clean_result).get("stance_polarity", "") or ""
+    except Exception:
+        return ""
+
+
+def _get_relation_direction(clean_result: dict) -> str:
+    try:
+        return _get_output(clean_result).get("relation_direction", "") or ""
+    except Exception:
+        return ""
+
+
+def _get_argument_rationale(clean_result: dict) -> str:
+    try:
+        return _get_output(clean_result).get("argument_rationale", "") or ""
+    except Exception:
+        return ""
+
+
+def _get_embedding_ready_text(clean_result: dict) -> str:
+    try:
+        return _get_output(clean_result).get("embedding_ready_text", "") or ""
+    except Exception:
+        return ""
+
+
+def _build_embedding_ready_text(
+    *,
+    canonical_claim: str,
+    claim_type: str,
+    argument_target: str,
+    target_type: str,
+    stance_polarity: str,
+    relation_direction: str,
+    argument_rationale: str,
+    argument_claim_canonical: str,
+) -> str:
+    claim_text = _normalize_text(
+        canonical_claim,
+        _normalize_text(argument_claim_canonical, "Sem claim canonica identificada"),
+    )
+    target_text = _normalize_text(argument_target, "unknown")
+    target_type_text = _normalize_text(target_type, "other")
+    stance_text = _normalize_text(stance_polarity, "neutral")
+
+    if claim_type == "factual":
+        relation_fallback = "report"
+    elif claim_type == "descriptive":
+        relation_fallback = "describe"
+    else:
+        relation_fallback = "state"
+
+    relation_text = _normalize_text(relation_direction, relation_fallback)
+    rationale_text = _normalize_text(
+        argument_rationale,
+        "insufficient argumentative detail" if claim_type in {"factual", "descriptive"} else "implicit justification",
+    )
+
+    return (
+        f"Target: {target_text}. "
+        f"TargetType: {target_type_text}. "
+        f"Stance: {stance_text}. "
+        f"Relation: {relation_text}. "
+        f"Claim: {claim_text}. "
+        f"Rationale: {rationale_text}."
+    )
+
+
 def _select_embedding_text(
     embedding_variant: str,
     core_narrative: str,
     framing_text: str,
     canonical_claim: str,
+    embedding_ready_text: str,
     argument_claim_canonical: str,
     argument_claim_raw: str,
 ) -> tuple[str, bool, str]:
-    # `canonical_claim` remains as a compatibility alias, but the preferred
-    # argument embedding path is `argument_claim_canonical`.
-    variant_map = {
-        "framing": framing_text,
-        "core_narrative": core_narrative,
-        "canonical_claim": argument_claim_canonical or canonical_claim,
-        "argument_claim_canonical": argument_claim_canonical,
-        "argument_claim_raw": argument_claim_raw,
-    }
-    selected_text = (variant_map.get(embedding_variant) or "").strip()
-    if embedding_variant == "canonical_claim" and argument_claim_canonical.strip():
-        selected_field = "argument_claim_canonical"
-    else:
-        selected_field = embedding_variant
+    del embedding_variant, core_narrative, framing_text, canonical_claim, argument_claim_canonical, argument_claim_raw
+    selected_text = (embedding_ready_text or "").strip()
+    selected_field = "embedding_ready_text"
     missing_selected_text = not bool(selected_text)
     if missing_selected_text:
-        selected_text = DEFAULT_TEXT_FALLBACKS[embedding_variant]
-        selected_field = f"{embedding_variant}_fallback"
+        selected_text = DEFAULT_TEXT_FALLBACKS["embedding_ready_text"]
+        selected_field = "embedding_ready_text_fallback"
     return selected_text, missing_selected_text, selected_field
 
 
-def _should_include_in_argument_embedding(embedding_variant: str, claim_type: str) -> tuple[bool, Optional[str]]:
-    # Purely factual items remain persisted for audit, but they stay out of the
-    # main argument embedding/clustering path.
-    if embedding_variant in ARGUMENT_EMBEDDING_VARIANTS and claim_type == "factual":
-        return False, "claim_type_factual"
+def _should_include_in_argument_embedding(
+    *,
+    claim_type: str,
+    argument_target: str,
+    stance_polarity: str,
+    argument_rationale: str,
+) -> tuple[bool, Optional[str]]:
     return True, None
 
 
@@ -216,25 +303,35 @@ def _build_embedding_item(
     canonical_claim: str,
     claim_type: str,
     factual_claim: str,
+    argument_target: str,
+    target_type: str,
+    stance_polarity: str,
+    relation_direction: str,
+    argument_rationale: str,
+    embedding_ready_text: str,
     argument_claim_canonical: str,
     argument_claim_raw: str,
     embedding_variant: str,
+    nps: dict | None = None,
 ) -> dict:
     # Preferred operational rule:
-    # - main embedding unit: argument_claim_canonical
+    # - main embedding unit: embedding_ready_text
     # - auxiliary audit trail: argument_claim_raw
-    # - factual items: stored, but excluded from the main argument vector space
+    # - factual/descriptive items: stored, but excluded from the main argument vector space
     text_used_for_embedding, missing_selected_text, embedding_text_source = _select_embedding_text(
         embedding_variant=embedding_variant,
         core_narrative=core_narrative,
         framing_text=framing,
         canonical_claim=canonical_claim,
+        embedding_ready_text=embedding_ready_text,
         argument_claim_canonical=argument_claim_canonical,
         argument_claim_raw=argument_claim_raw,
     )
     included_in_argument_embedding, exclusion_reason = _should_include_in_argument_embedding(
-        embedding_variant=embedding_variant,
         claim_type=claim_type,
+        argument_target=argument_target,
+        stance_polarity=stance_polarity,
+        argument_rationale=argument_rationale,
     )
     claim_missing = not bool((canonical_claim or "").strip())
     claim_fallback_used = embedding_text_source.endswith("_fallback")
@@ -249,6 +346,12 @@ def _build_embedding_item(
         "journalistic_framing": output.get("journalistic_framing"),
         "claim_type": claim_type,
         "factual_claim": factual_claim or None,
+        "argument_target": argument_target or None,
+        "target_type": target_type or None,
+        "stance_polarity": stance_polarity or None,
+        "relation_direction": relation_direction or None,
+        "argument_rationale": argument_rationale or None,
+        "embedding_ready_text": embedding_ready_text or None,
         "argument_claim_canonical": argument_claim_canonical or None,
         "argument_claim_raw": argument_claim_raw or None,
         "canonical_claim": canonical_claim or None,
@@ -260,7 +363,125 @@ def _build_embedding_item(
         "missing_selected_text": missing_selected_text,
         "included_in_argument_embedding": included_in_argument_embedding,
         "argument_embedding_exclusion_reason": exclusion_reason,
+        "stance_score": float(output.get("stance_score", 0.0)),
+        "tone_score": float(output.get("tone_score", 0.0)),
+        # NPS fields — populated for YouTube and Bluesky, zero for News
+        "nps_stage_level": (nps or {}).get("stage_level", 0.0),
+        "nps_passive_force": (nps or {}).get("passive_force", 0.0),
+        "nps_directional_juice": (nps or {}).get("directional_juice", 0.0),
+        "nps_active_force": (nps or {}).get("active_force", 0.0),
+        "nps_narrative_power_score": (nps or {}).get("narrative_power_score", 0.0),
+        "nps_attention_volume": (nps or {}).get("attention_volume", 0.0),
     }
+
+# ==========================================
+# NPS: COMMENT ALIGNMENT + ENGAGEMENT METRICS
+# ==========================================
+
+def _compute_nps_for_item(
+    *,
+    client,
+    platform: str,
+    raw_comments: list[dict],
+    core_narrative: str,
+    views: int = 0,
+    post_likes: int = 0,
+    reposts: int = 0,
+    total_comments: int = 0,
+) -> dict:
+    """
+    Orchestrates the full NPS computation for a single post.
+
+    Steps:
+      1. If the post has sampled comments, send their texts to the LLM to
+         obtain one alignment float per comment (the LLM returns a JSON
+         array of floats, nothing else).
+      2. Inject the scraper's `likes` alongside each LLM alignment to build
+         a List[CommentAnalysis].
+      3. Instantiate EngagementMetrics with the combined data — all five
+         computed fields (stage_level, passive_force, directional_juice,
+         active_force, narrative_power_score) resolve automatically.
+      4. Return a flat dict of the five NPS fields, ready to be merged into
+         the embedding item record.
+
+    Args:
+        client: Initialized Google GenAI client.
+        platform: "youtube" or "bluesky".
+        raw_comments: List of raw comment dicts from the scraper, each
+            containing at least 'text' and 'likes' keys.
+        core_narrative: LLM-extracted core narrative of the parent post,
+            used as the reference frame for alignment scoring.
+        views: YouTube view count (ignored for Bluesky).
+        post_likes: Likes on the post itself.
+        reposts: Repost / share count.
+        total_comments: Macro comment volume (may exceed len(raw_comments)
+            since raw_comments is only the sampled top-N).
+
+    Returns:
+        Dict with keys: stage_level, passive_force, directional_juice,
+        active_force, narrative_power_score.
+        Returns zeros for all fields on any error.
+    """
+    _zero = {
+        "stage_level": 0.0,
+        "passive_force": 0.0,
+        "directional_juice": 0.0,
+        "active_force": 0.0,
+        "narrative_power_score": 0.0,
+    }
+
+    try:
+        top_comments: list[CommentAnalysis] = []
+
+        if raw_comments and core_narrative:
+            prompt = create_comment_alignment_prompt(raw_comments, core_narrative)
+            try:
+                response = client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    config={
+                        "system_instruction": system_instruction_comment_alignment,
+                        "response_mime_type": "application/json",
+                    },
+                    contents=prompt,
+                )
+                import json as _json
+                alignments: list[float] = _json.loads(response.text)
+
+                # Zip scraper likes with LLM alignments (guard against length mismatch)
+                for raw_c, alignment in zip(raw_comments, alignments):
+                    likes = int(raw_c.get("likes", 0))
+                    # Clamp alignment to [-1.0, 1.0] in case LLM drifts slightly
+                    alignment = max(-1.0, min(1.0, float(alignment)))
+                    top_comments.append(CommentAnalysis(likes=likes, alignment=alignment))
+            except Exception as e:
+                print(f"    [NPS] Erro ao obter alinhamentos dos comentarios: {e}")
+                # Fall back to zero alignment so passive_force still computes
+                for raw_c in raw_comments:
+                    top_comments.append(
+                        CommentAnalysis(likes=int(raw_c.get("likes", 0)), alignment=0.0)
+                    )
+
+        metrics = EngagementMetrics(
+            platform=platform,
+            views=views,
+            post_likes=post_likes,
+            reposts=reposts,
+            total_comments=total_comments,
+            top_comments=top_comments,
+        )
+
+        return {
+            "stage_level": metrics.stage_level,
+            "passive_force": metrics.passive_force,
+            "directional_juice": metrics.directional_juice,
+            "active_force": metrics.active_force,
+            "narrative_power_score": metrics.narrative_power_score,
+            "attention_volume": metrics.attention_volume,
+        }
+
+    except Exception as e:
+        print(f"    [NPS] Erro inesperado no calculo do NPS: {e}")
+        return _zero
 
 
 # ==========================================
@@ -368,9 +589,38 @@ def run_analysis(data=None, topic=None, embedding_variant="framing"):
                 canonical_claim = _get_canonical_claim(clean)
                 claim_type = _get_claim_type(clean)
                 factual_claim = _get_factual_claim(clean)
+                argument_target = _get_argument_target(clean)
+                target_type = _get_target_type(clean)
+                stance_polarity = _get_stance_polarity(clean)
+                relation_direction = _get_relation_direction(clean)
+                argument_rationale = _get_argument_rationale(clean)
+                embedding_ready_text = _get_embedding_ready_text(clean)
                 argument_claim_canonical = _get_argument_claim_canonical(clean)
                 argument_claim_raw = _get_argument_claim_raw(clean)
+                embedding_ready_text = _normalize_text(
+                    embedding_ready_text,
+                    _build_embedding_ready_text(
+                        canonical_claim=canonical_claim,
+                        claim_type=claim_type,
+                        argument_target=argument_target,
+                        target_type=target_type,
+                        stance_polarity=stance_polarity,
+                        relation_direction=relation_direction,
+                        argument_rationale=argument_rationale,
+                        argument_claim_canonical=argument_claim_canonical,
+                    ),
+                )
                 original = _get_original_content(video, "YouTube")
+                nps = _compute_nps_for_item(
+                    client=client,
+                    platform="youtube",
+                    raw_comments=video.get("most_liked_comments", []),
+                    core_narrative=core_narrative,
+                    views=video.get("statistics", {}).get("views", 0),
+                    post_likes=video.get("statistics", {}).get("likes", 0),
+                    reposts=0,
+                    total_comments=video.get("statistics", {}).get("total_comments", 0),
+                )
                 items_for_embedding.append(_build_embedding_item(
                     item_id=item_id,
                     source="youtube",
@@ -382,9 +632,16 @@ def run_analysis(data=None, topic=None, embedding_variant="framing"):
                     canonical_claim=canonical_claim,
                     claim_type=claim_type,
                     factual_claim=factual_claim,
+                    argument_target=argument_target,
+                    target_type=target_type,
+                    stance_polarity=stance_polarity,
+                    relation_direction=relation_direction,
+                    argument_rationale=argument_rationale,
+                    embedding_ready_text=embedding_ready_text,
                     argument_claim_canonical=argument_claim_canonical,
                     argument_claim_raw=argument_claim_raw,
                     embedding_variant=embedding_variant,
+                    nps=nps,
                 ))
                 print(f"  ✓ Vídeo {i+1} analisado com sucesso.")
             except Exception as e:
@@ -419,9 +676,38 @@ def run_analysis(data=None, topic=None, embedding_variant="framing"):
                 canonical_claim = _get_canonical_claim(clean)
                 claim_type = _get_claim_type(clean)
                 factual_claim = _get_factual_claim(clean)
+                argument_target = _get_argument_target(clean)
+                target_type = _get_target_type(clean)
+                stance_polarity = _get_stance_polarity(clean)
+                relation_direction = _get_relation_direction(clean)
+                argument_rationale = _get_argument_rationale(clean)
+                embedding_ready_text = _get_embedding_ready_text(clean)
                 argument_claim_canonical = _get_argument_claim_canonical(clean)
                 argument_claim_raw = _get_argument_claim_raw(clean)
+                embedding_ready_text = _normalize_text(
+                    embedding_ready_text,
+                    _build_embedding_ready_text(
+                        canonical_claim=canonical_claim,
+                        claim_type=claim_type,
+                        argument_target=argument_target,
+                        target_type=target_type,
+                        stance_polarity=stance_polarity,
+                        relation_direction=relation_direction,
+                        argument_rationale=argument_rationale,
+                        argument_claim_canonical=argument_claim_canonical,
+                    ),
+                )
                 original = _get_original_content(post, "Bluesky")
+                nps = _compute_nps_for_item(
+                    client=client,
+                    platform="bluesky",
+                    raw_comments=post.get("most_liked_comments", []),
+                    core_narrative=core_narrative,
+                    views=0,
+                    post_likes=post.get("likes", 0),
+                    reposts=post.get("reposts", 0),
+                    total_comments=post.get("reply_count", 0),
+                )
                 items_for_embedding.append(_build_embedding_item(
                     item_id=item_id,
                     source="bluesky",
@@ -433,9 +719,16 @@ def run_analysis(data=None, topic=None, embedding_variant="framing"):
                     canonical_claim=canonical_claim,
                     claim_type=claim_type,
                     factual_claim=factual_claim,
+                    argument_target=argument_target,
+                    target_type=target_type,
+                    stance_polarity=stance_polarity,
+                    relation_direction=relation_direction,
+                    argument_rationale=argument_rationale,
+                    embedding_ready_text=embedding_ready_text,
                     argument_claim_canonical=argument_claim_canonical,
                     argument_claim_raw=argument_claim_raw,
                     embedding_variant=embedding_variant,
+                    nps=nps,
                 ))
                 print(f"  ✓ Post {i+1} analisado com sucesso.")
             except Exception as e:
@@ -470,8 +763,27 @@ def run_analysis(data=None, topic=None, embedding_variant="framing"):
                 canonical_claim = _get_canonical_claim(clean)
                 claim_type = _get_claim_type(clean)
                 factual_claim = _get_factual_claim(clean)
+                argument_target = _get_argument_target(clean)
+                target_type = _get_target_type(clean)
+                stance_polarity = _get_stance_polarity(clean)
+                relation_direction = _get_relation_direction(clean)
+                argument_rationale = _get_argument_rationale(clean)
+                embedding_ready_text = _get_embedding_ready_text(clean)
                 argument_claim_canonical = _get_argument_claim_canonical(clean)
                 argument_claim_raw = _get_argument_claim_raw(clean)
+                embedding_ready_text = _normalize_text(
+                    embedding_ready_text,
+                    _build_embedding_ready_text(
+                        canonical_claim=canonical_claim,
+                        claim_type=claim_type,
+                        argument_target=argument_target,
+                        target_type=target_type,
+                        stance_polarity=stance_polarity,
+                        relation_direction=relation_direction,
+                        argument_rationale=argument_rationale,
+                        argument_claim_canonical=argument_claim_canonical,
+                    ),
+                )
                 original = _get_original_content(article, "News")
                 items_for_embedding.append(_build_embedding_item(
                     item_id=item_id,
@@ -484,6 +796,12 @@ def run_analysis(data=None, topic=None, embedding_variant="framing"):
                     canonical_claim=canonical_claim,
                     claim_type=claim_type,
                     factual_claim=factual_claim,
+                    argument_target=argument_target,
+                    target_type=target_type,
+                    stance_polarity=stance_polarity,
+                    relation_direction=relation_direction,
+                    argument_rationale=argument_rationale,
+                    embedding_ready_text=embedding_ready_text,
                     argument_claim_canonical=argument_claim_canonical,
                     argument_claim_raw=argument_claim_raw,
                     embedding_variant=embedding_variant,
@@ -519,7 +837,7 @@ def run_analysis(data=None, topic=None, embedding_variant="framing"):
         "embedding_variant": embedding_variant,
         "primary_argument_embedding_variant": PRIMARY_ARGUMENT_EMBEDDING_VARIANT,
         "auxiliary_argument_audit_variant": AUXILIARY_ARGUMENT_AUDIT_VARIANT,
-        "factual_routing_rule": "exclude_from_argument_embedding_when_claim_type_is_factual",
+        "factual_routing_rule": "include_only_when_claim_type_is_argumentative_or_mixed_and_target_stance_rationale_are_present",
         "embedding_model": EMBEDDING_MODEL,
         "clustering_algorithm": "kmeans",
         "n_clusters": 3,
@@ -528,6 +846,18 @@ def run_analysis(data=None, topic=None, embedding_variant="framing"):
         "excluded_from_argument_embedding_count": len(items_for_embedding) - len(items_for_argument_embedding),
         "excluded_factual_count": sum(
             1 for item in items_for_embedding if item["argument_embedding_exclusion_reason"] == "claim_type_factual"
+        ),
+        "excluded_descriptive_count": sum(
+            1 for item in items_for_embedding if item["argument_embedding_exclusion_reason"] == "claim_type_descriptive"
+        ),
+        "excluded_missing_target_count": sum(
+            1 for item in items_for_embedding if item["argument_embedding_exclusion_reason"] == "missing_argument_target"
+        ),
+        "excluded_missing_stance_count": sum(
+            1 for item in items_for_embedding if item["argument_embedding_exclusion_reason"] in {"missing_stance_polarity", "stance_not_interpretive_enough"}
+        ),
+        "excluded_missing_rationale_count": sum(
+            1 for item in items_for_embedding if item["argument_embedding_exclusion_reason"] == "missing_argument_rationale"
         ),
         "fallback_zero_vector_count": 0,
         "claim_missing_count": sum(1 for item in items_for_embedding if item["claim_missing"]),
@@ -575,7 +905,7 @@ def run_analysis(data=None, topic=None, embedding_variant="framing"):
                 anchor_embeddings.append(np.zeros(768))
 
         # 7.3. K-Means nos embeddings dos itens (k=3)
-        print(">> Aplicando K-Means (k=3) nos embeddings dos itens...")
+        # print(">> Aplicando K-Means (k=3) nos embeddings dos itens...") # LOG MUDO P/ NÃO CONFUNDIR O DEV
         all_item_embs = np.array(item_embeddings)
 
         if len(all_item_embs) >= 3:
@@ -586,7 +916,7 @@ def run_analysis(data=None, topic=None, embedding_variant="framing"):
             clusters = np.zeros(len(all_item_embs), dtype=int)
 
         # 7.4. t-SNE — todos juntos (itens + âncoras)
-        print(">> Aplicando t-SNE (2D) para redução de dimensionalidade...")
+        # print(">> Aplicando t-SNE (2D) para redução de dimensionalidade...") # LOG MUDO P/ NÃO CONFUNDIR O DEV
         all_embeddings = np.vstack([all_item_embs] + [e.reshape(1, -1) for e in anchor_embeddings])
 
         # Ajustar perplexity se houver poucos pontos
@@ -613,6 +943,12 @@ def run_analysis(data=None, topic=None, embedding_variant="framing"):
                 "journalistic_framing": item["journalistic_framing"],
                 "claim_type": item["claim_type"],
                 "factual_claim": item["factual_claim"],
+                "argument_target": item["argument_target"],
+                "target_type": item["target_type"],
+                "stance_polarity": item["stance_polarity"],
+                "relation_direction": item["relation_direction"],
+                "argument_rationale": item["argument_rationale"],
+                "embedding_ready_text": item["embedding_ready_text"],
                 "argument_claim_canonical": item["argument_claim_canonical"],
                 "argument_claim_raw": item["argument_claim_raw"],
                 "canonical_claim": item["canonical_claim"],
@@ -641,6 +977,12 @@ def run_analysis(data=None, topic=None, embedding_variant="framing"):
                 "journalistic_framing": None,
                 "claim_type": None,
                 "factual_claim": None,
+                "argument_target": None,
+                "target_type": None,
+                "stance_polarity": None,
+                "relation_direction": None,
+                "argument_rationale": None,
+                "embedding_ready_text": None,
                 "argument_claim_canonical": None,
                 "argument_claim_raw": None,
                 "canonical_claim": None,
@@ -696,9 +1038,31 @@ TOPICS_TO_ANALYZE = [
 ]
 
 if __name__ == "__main__":
-    import time, random
+    import time, random, sys
 
     scraping_dir = Path("outputs") / "scraping"
+    
+    # PARAMETRO NOVO: Defina o nome do arquivo exato para rodar apenas ele.
+    # Exemplo: SPECIFIC_FILE_TO_ANALYZE = "atuação_do_stf_2026-04-08_15-09.json"
+    # Se deixar como None, o script roda o fluxo normal para todos os tópicos.
+    SPECIFIC_FILE_TO_ANALYZE = "atuação_do_stf_2026-04-08_15-09.json"
+
+    if SPECIFIC_FILE_TO_ANALYZE:
+        print(f"[LLM Analysis] Analisando apenas o arquivo especifico: {SPECIFIC_FILE_TO_ANALYZE}")
+        target_file = scraping_dir / SPECIFIC_FILE_TO_ANALYZE
+        if not target_file.exists():
+            print(f"Erro: Arquivo nao encontrado -> {target_file}")
+            sys.exit(1)
+        else:
+            with open(target_file, "r", encoding="utf-8") as f:
+                import json
+                data = json.load(f)
+            topic_guess = " ".join(SPECIFIC_FILE_TO_ANALYZE.split("_202")[0].split("_")).title()
+            print(f"-> Assumindo topico: '{topic_guess}'")
+            run_analysis(data=data, topic=topic_guess, embedding_variant="argument_claim_canonical")
+            print("Analise especifica concluida!")
+            sys.exit(0)
+
     print(f"[LLM Analysis] Iniciando analise para {len(TOPICS_TO_ANALYZE)} temas...\n")
 
     for idx, topic in enumerate(TOPICS_TO_ANALYZE):
@@ -708,14 +1072,15 @@ if __name__ == "__main__":
             key=lambda p: p.stat().st_mtime, reverse=True
         )
         if not matching_files:
-            print(f"[{idx+1}/{len(TOPICS_TO_ANALYZE)}] Nenhum arquivo para topic=\'{topic}\'. Pulando.")
+            print(f"[{idx+1}/{len(TOPICS_TO_ANALYZE)}] Nenhum arquivo para topic='{topic}'. Pulando.")
             continue
         latest_file = matching_files[0]
-        print(f"[{idx+1}/{len(TOPICS_TO_ANALYZE)}] Analisando \'{topic}\' -> {latest_file.name}")
+        print(f"[{idx+1}/{len(TOPICS_TO_ANALYZE)}] Analisando '{topic}' -> {latest_file.name}")
         with open(latest_file, "r", encoding="utf-8") as f:
+            import json
             data = json.load(f)
         run_analysis(data=data, topic=topic, embedding_variant="argument_claim_canonical")
-        print(f"Tema \'{topic}\' concluido.\n")
+        print(f"Tema '{topic}' concluido.\n")
         if idx < len(TOPICS_TO_ANALYZE) - 1:
             cooldown = random.uniform(10, 20)
             print(f"[LLM] Pausando {cooldown:.1f}s...")
